@@ -7,3 +7,4 @@ env
 coinrun/.build-debug
 coinrun/.build-release
 coinrun/.generated
+models
