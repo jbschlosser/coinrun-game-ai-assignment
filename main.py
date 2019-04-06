@@ -592,7 +592,7 @@ def doMakeBatch(replay_memory, batch_size):
 def doPredictQValues(policy_net, states_batch, actions_batch):
     q_value = policy_net(states_batch)
     choose_all = torch.arange(0, q_value.shape[0], device=DEVICE).long()
-    select_action = actions_batch.view(-1)
+    select_action = actions_batch.long().view(-1)
     state_action_values = q_value[choose_all, select_action][:,None]
     return state_action_values
 
