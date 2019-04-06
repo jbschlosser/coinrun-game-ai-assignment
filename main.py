@@ -244,10 +244,15 @@ class ReplayMemory(object):
     ###    If capacity is reached, start overwriting the beginning of the array.
     ###    Use the position index to keep track of where to put the next item. 
     def push(self, state, action, next_state, reward):
-        ### WRITE YOUR CODE BELOW HERE
-
-        ### WRITE YOUR CODE ABOVE HERE
-        return None
+        trans = Transition(state=state,
+                           action=action,
+                           next_state=next_state,
+                           reward=reward)
+        if(len(self.memory) == self.capacity):
+            self.memory[self.position] = trans
+            self.position = (self.position + 1) % self.capacity
+        else:
+            self.memory.append(trans)
 
     ### Return a batch of transition objects from memory containing batch_size elements.
     def sample(self, batch_size):
@@ -267,18 +272,24 @@ class DQN(nn.Module):
     ### automatically when forward() is called.
     def __init__(self, h, w, num_actions):
         super(DQN, self).__init__()
-        self.num_actions = num_actions
-        ### WRITE YOUR CODE BELOW HERE
-
-        ### WRITE YOUR CODE ABOVE HERE
+        in_channels = 3 # Single RGB frame
+        self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=8, stride=4)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
+        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
+        self.fc4 = nn.Linear(7 * 7 * 64, 512)
+        self.fc5 = nn.Linear(512, num_actions)
 
     # Called with either one element to determine next action, or a batch
     # during optimization. Returns tensor([[left0exp,right0exp]...]).
     def forward(self, x):
-        q_values = None
-        ### WRITE YOUR CODE BELOW HERE
-
-        ### WRITE YOUR CODE ABOVE HERE
+        # Expected x shape: NxCxHxW
+        # Required input is size 84x84.
+        x = F.interpolate(x, size=(84, 84))
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = F.relu(self.fc4(x.view(x.size(0), -1)))
+        q_values = self.fc5(x)
         return q_values
 
 ##########################################################
@@ -506,10 +517,7 @@ def unit_test():
 ### Output:
 ### - the optimizer object
 def initializeOptimizer(parameters):
-    optimizer = None
-    ### WRITE YOUR CODE BELOW HERE
-
-    ### WRITE YOUR CODE ABOVE HERE
+    optimizer = torch.optim.Adam(parameters)
     return optimizer
 
 ### Select an action to perform. 
@@ -528,9 +536,12 @@ def initializeOptimizer(parameters):
 def select_action(state, policy_net, num_actions, epsilon, steps_done = 0, bootstrap_threshold = 0):
     action = None
     new_epsilon = epsilon
-    ### WRITE YOUR CODE BELOW HERE
-
-    ### WRITE YOUR CODE ABOVE HERE
+    if torch.rand(size=(1,)).item() < epsilon:
+        # Sample a random action uniformly.
+        action = torch.randint(0, num_actions, size=(1,))[:,None]
+    else:
+        # Use the policy network to pick an action.
+        action = torch.argmax(policy_net(state[None,:]),dim=1)[:,None]
     return action, new_epsilon
 
 ### Ask for a batch of experience replays.
@@ -544,14 +555,24 @@ def select_action(state, policy_net, num_actions, epsilon, steps_done = 0, boots
 ### - rewards_batch: a tensor of shape batch_size x 1 containing reward values.
 ### - non_final_mask: a tensor of bytes of length batch_size containing a 0 if the state is terminal or 1 otherwise
 def doMakeBatch(replay_memory, batch_size):
-    states_batch = None
-    actions_batch = None
-    next_states_batch = None
-    rewards_batch = None
-    non_final_mask = None
-    ### WRITE YOUR CODE BELOW HERE
-
-    ### WRITE YOUR CODE ABOVE HERE
+    assert batch_size > 0
+    samples = replay_memory.sample(batch_size)
+    first = samples[0]
+    states_batch = torch.empty((batch_size, *first.state.shape[1:]))
+    actions_batch = torch.empty((batch_size, 1))
+    next_states_batch = torch.empty((batch_size, *first.state.shape[1:]))
+    rewards_batch = torch.empty((batch_size, 1))
+    non_final_mask = torch.empty((batch_size,))
+    for i, sample in enumerate(samples):
+        states_batch[i] = sample.state
+        actions_batch[i] = sample.action
+        rewards_batch[i] = sample.reward
+        if sample.next_state is None:
+            next_states_batch[i] = torch.zeros(sample.state.shape)
+            non_final_mask[i] = 0
+        else:
+            next_states_batch[i] = sample.next_state
+            non_final_mask[i] = 1
     return states_batch, actions_batch, next_states_batch, rewards_batch, non_final_mask
 
 
@@ -563,10 +584,10 @@ def doMakeBatch(replay_memory, batch_size):
 ### Output:
 ### - A tensor of shape batch_size x 1 containing the Q-value predicted by the DQN in the position indicated by the action
 def doPredictQValues(policy_net, states_batch, actions_batch):
-    state_action_values = None
-    ### WRITE YOUR CODE BELOW HERE
-
-    ### WRITE YOUR CODE ABOVE HERE
+    q_value = policy_net(states_batch)
+    choose_all = torch.arange(0, q_value.shape[0]).long()
+    select_action = actions_batch.long().view(-1)
+    state_action_values = q_value[choose_all, select_action][:,None]
     return state_action_values
 
 ### Ask the policy_net to predict the utility of a next_state.
@@ -580,9 +601,10 @@ def doPredictQValues(policy_net, states_batch, actions_batch):
 ### - A tensor of shape batch_size x 1 containing Q-values
 def doPredictNextStateUtilities(policy_net, next_states_batch, non_final_mask, batch_size):
     next_state_values = torch.zeros(batch_size, device=DEVICE)
-    ### WRITE YOUR CODE BELOW HERE
-
-    ### WRITE YOUR CODE ABOVE HERE
+    next_states_masked = next_states_batch[non_final_mask,:,:,:]
+    q_values = torch.max(policy_net(next_states_masked), dim=1)[0]
+    next_state_values[non_final_mask] = q_values
+    next_state_values = next_state_values[:,None]
     return next_state_values.detach()
 
 ### Compute the Q-update equation Q(s_t, a_t) = R(s_t+1) + gamma * argmax_a' Q(s_t+1, a')
@@ -592,11 +614,7 @@ def doPredictNextStateUtilities(policy_net, next_states_batch, non_final_mask, b
 ### Output:
 ### - A tensor of shape batch_size x 1
 def doComputeExpectedQValues(next_state_values, rewards_batch, gamma):
-    expected_state_action_values = None
-    ### WRITE YOUR CODE BELOW HERE
-
-    ### WRITE YOUR CODE ABOVE HERE
-    return expected_state_action_values
+    return next_state_values * gamma + rewards_batch
 
 ### Compute the loss
 ### Inputs:
@@ -605,10 +623,8 @@ def doComputeExpectedQValues(next_state_values, rewards_batch, gamma):
 ### Output:
 ### - A tensor scalar value
 def doComputeLoss(state_action_values, expected_state_action_values):
-    loss = None
-    ### WRITE YOUR CODE BELOW HERE
-
-    ### WRITE YOUR CODE ABOVE HERE
+    loss = F.smooth_l1_loss(state_action_values, expected_state_action_values,
+                            size_average='mean')
     return loss
 
 ### Run backpropagation. Make sure gradients are clipped between -1 and +1.
@@ -617,10 +633,9 @@ def doComputeLoss(state_action_values, expected_state_action_values):
 ### - parameters: the parameters of the DQN
 ### There is no output
 def doBackprop(loss, parameters):
-    ### WRITE YOUR CODE BELOW HERE
-
-    ### WRITE YOUR CODE ABOVE HERE
-    return None
+    # Do gradient clipping.
+    grads = torch.clamp(loss.backward(), -1, 1)
+    return grads
 
 
 
