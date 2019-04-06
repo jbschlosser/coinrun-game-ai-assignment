@@ -1,0 +1,9 @@
+*.o
+*.dep
+*.moc
+__pycache__
+*.so
+env
+coinrun/.build-debug
+coinrun/.build-release
+coinrun/.generated
