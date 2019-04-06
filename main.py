@@ -639,9 +639,10 @@ def doComputeLoss(state_action_values, expected_state_action_values):
 ### - parameters: the parameters of the DQN
 ### There is no output
 def doBackprop(loss, parameters):
+    loss.backward()
     # Do gradient clipping.
-    grads = torch.clamp(loss.backward(), -1, 1)
-    return grads
+    for parameter in parameters:
+        parameter.grad.clamp_(-1, 1)
 
 
 
