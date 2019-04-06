@@ -165,6 +165,12 @@ resize = T.Compose([T.ToPILImage(),
                     T.Resize(RESIZE_CONST, interpolation=Image.CUBIC),
                     T.ToTensor()])
 
+def printAllTensors():
+    import gc
+    for obj in gc.get_objects():
+        if torch.is_tensor(obj) or (hasattr(obj, 'data') and torch.is_tensor(obj.data)):
+            print(obj.type(), obj.size())
+
 ### Take the environment and return a tensor containing screen data as a 3D tensor containing (color, height, width) information.
 ### Optional: the screen may be manipulated, for example, it could be cropped
 def get_screen(env):
@@ -427,7 +433,7 @@ def testPredictQValues():
     num_actions = 7
     net = DQN(screen_height, screen_width, num_actions).to(DEVICE)
     states_batch = torch.randn(batch_size, 3, 80, 80, device=DEVICE)
-    actions_batch = torch.randint(0, 7, (128, 1), device=DEVICE)
+    actions_batch = torch.randint(0, 7, (128, 1), device=DEVICE).long()
     state_action_values = doPredictQValues(net, states_batch, actions_batch)
     assert(type(state_action_values) == torch.Tensor and state_action_values.size() == (128, 1)), "Return value not correct shape."
     print("doPredictQValues test passed.")
@@ -535,7 +541,7 @@ def initializeOptimizer(parameters):
 ### - The new epsilon value to use next time
 def select_action(state, policy_net, num_actions, epsilon, steps_done = 0, bootstrap_threshold = 0):
     action = None
-    new_epsilon = 0.999 * epsilon
+    new_epsilon = epsilon if steps_done <= bootstrap_threshold else 0.999 * epsilon
     if torch.rand(size=(1,)).item() < epsilon:
         # Sample a random action uniformly.
         action = torch.randint(0, num_actions, size=(1,))[:,None].long()
@@ -558,17 +564,17 @@ def doMakeBatch(replay_memory, batch_size):
     assert batch_size > 0
     samples = replay_memory.sample(batch_size)
     first = samples[0]
-    states_batch = torch.empty((batch_size, *first.state.shape[1:]))
-    actions_batch = torch.empty((batch_size, 1))
-    next_states_batch = torch.empty((batch_size, *first.state.shape[1:]))
-    rewards_batch = torch.empty((batch_size, 1))
-    non_final_mask = torch.empty((batch_size,))
+    states_batch = torch.empty((batch_size, *first.state.shape[1:]), device=DEVICE)
+    actions_batch = torch.empty((batch_size, 1), device=DEVICE).long()
+    next_states_batch = torch.empty((batch_size, *first.state.shape[1:]), device=DEVICE)
+    rewards_batch = torch.empty((batch_size, 1), device=DEVICE)
+    non_final_mask = torch.empty((batch_size,), device=DEVICE).long()
     for i, sample in enumerate(samples):
         states_batch[i] = sample.state
         actions_batch[i] = sample.action
         rewards_batch[i] = sample.reward
         if sample.next_state is None:
-            next_states_batch[i] = torch.zeros(sample.state.shape)
+            next_states_batch[i] = torch.zeros(sample.state.shape, device=DEVICE)
             non_final_mask[i] = 0
         else:
             next_states_batch[i] = sample.next_state
@@ -584,9 +590,9 @@ def doMakeBatch(replay_memory, batch_size):
 ### Output:
 ### - A tensor of shape batch_size x 1 containing the Q-value predicted by the DQN in the position indicated by the action
 def doPredictQValues(policy_net, states_batch, actions_batch):
-    q_value = policy_net(states_batch.to(DEVICE))
-    choose_all = torch.arange(0, q_value.shape[0]).long()
-    select_action = actions_batch.long().view(-1)
+    q_value = policy_net(states_batch)
+    choose_all = torch.arange(0, q_value.shape[0], device=DEVICE).long()
+    select_action = actions_batch.view(-1)
     state_action_values = q_value[choose_all, select_action][:,None]
     return state_action_values
 
