@@ -535,14 +535,13 @@ def initializeOptimizer(parameters):
 ### - The new epsilon value to use next time
 def select_action(state, policy_net, num_actions, epsilon, steps_done = 0, bootstrap_threshold = 0):
     action = None
-    new_epsilon = epsilon
+    new_epsilon = 0.999 * epsilon
     if torch.rand(size=(1,)).item() < epsilon:
         # Sample a random action uniformly.
         action = torch.randint(0, num_actions, size=(1,))[:,None].long()
     else:
         # Use the policy network to pick an action.
         action = torch.argmax(policy_net(state), dim=1)[:,None].long()
-    # TODO: Update epsilon.
     return action, new_epsilon
 
 ### Ask for a batch of experience replays.
@@ -585,7 +584,7 @@ def doMakeBatch(replay_memory, batch_size):
 ### Output:
 ### - A tensor of shape batch_size x 1 containing the Q-value predicted by the DQN in the position indicated by the action
 def doPredictQValues(policy_net, states_batch, actions_batch):
-    q_value = policy_net(states_batch)
+    q_value = policy_net(states_batch.to(DEVICE))
     choose_all = torch.arange(0, q_value.shape[0]).long()
     select_action = actions_batch.long().view(-1)
     state_action_values = q_value[choose_all, select_action][:,None]
