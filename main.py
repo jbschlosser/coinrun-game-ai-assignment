@@ -538,10 +538,11 @@ def select_action(state, policy_net, num_actions, epsilon, steps_done = 0, boots
     new_epsilon = epsilon
     if torch.rand(size=(1,)).item() < epsilon:
         # Sample a random action uniformly.
-        action = torch.randint(0, num_actions, size=(1,))[:,None]
+        action = torch.randint(0, num_actions, size=(1,))[:,None].long()
     else:
         # Use the policy network to pick an action.
-        action = torch.argmax(policy_net(state[None,:]),dim=1)[:,None]
+        action = torch.argmax(policy_net(state), dim=1)[:,None].long()
+    # TODO: Update epsilon.
     return action, new_epsilon
 
 ### Ask for a batch of experience replays.
@@ -624,7 +625,7 @@ def doComputeExpectedQValues(next_state_values, rewards_batch, gamma):
 ### - A tensor scalar value
 def doComputeLoss(state_action_values, expected_state_action_values):
     loss = F.smooth_l1_loss(state_action_values, expected_state_action_values,
-                            size_average='mean')
+                            reduction='elementwise_mean')
     return loss
 
 ### Run backpropagation. Make sure gradients are clipped between -1 and +1.
