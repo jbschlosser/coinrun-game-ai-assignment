@@ -541,7 +541,11 @@ def initializeOptimizer(parameters):
 ### - The new epsilon value to use next time
 def select_action(state, policy_net, num_actions, epsilon, steps_done = 0, bootstrap_threshold = 0):
     action = None
-    new_epsilon = epsilon if steps_done <= bootstrap_threshold else 0.999 * epsilon
+    new_epsilon = epsilon
+    if steps_done > bootstrap_threshold:
+        steps_after_bootstrap = steps_done - bootstrap_threshold
+        if steps_after_bootstrap % 1000 == 0:
+            new_epsilon = 0.999 * epsilon
     if torch.rand(size=(1,)).item() < epsilon:
         # Sample a random action uniformly.
         action = torch.randint(0, num_actions, size=(1,))[:,None].long()
