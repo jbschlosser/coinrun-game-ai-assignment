@@ -153,10 +153,10 @@ RANDOM_SEED = None          # Seed for random number generator, for reproducabil
 NUM_EPISODES = args.episodes if not IN_PYNB else 1000   # Max number of training episodes
 LOG_INTERVAL = 1000
 
-# Linearly decay epsilon over this many steps.
-EPSILON_DECAY_PERIOD = 250000
-
-
+# Linearly decay epsilon from start -> end over some number of steps.
+EPSILON_DECAY_PERIOD = 150000
+EPSILON_START = 0.9
+EPSILON_END = 0.1
 
 ############################################################
 ### HELPERS
@@ -549,9 +549,8 @@ def select_action(state, policy_net, num_actions, epsilon, steps_done = 0, boots
     action = None
     new_epsilon = epsilon
     if steps_done > bootstrap_threshold:
-        steps_after_bootstrap = steps_done - bootstrap_threshold
-        if steps_after_bootstrap % 100 == 0:
-            new_epsilon = max(EVAL_EPSILON, 0.999 * epsilon)
+        frac_done = min(1, (steps_done - bootstrap_threshold) / EPSILON_DECAY_PERIOD)
+        new_epsilon = (1 - frac_done) * EPSILON_START + frac_done * EPSILON_END
     if torch.rand(size=(1,)).item() < epsilon:
         # Sample a random action uniformly.
         action = torch.randint(0, num_actions, size=(1,))[:,None].long()
