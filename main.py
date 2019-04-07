@@ -41,6 +41,7 @@ import torchvision.transforms as T
 import os
 import argparse
 import pdb
+from tensorboardX import SummaryWriter
 
 
 ###########################################################
@@ -113,15 +114,17 @@ if not IN_PYNB:
     args = parser.parse_args()
 
 
+writer = SummaryWriter(log_dir=args.model_path)
 
 ###########################################################
 ### CONSTANTS
 
 # if gpu is to be used
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print('Using device:', DEVICE)
 
 # Resize the screen to this
-RESIZE_CONST = 40 
+RESIZE_CONST = 80
 
 # Defaults
 RENDER_SCREEN = args.render if not IN_PYNB else False
@@ -148,8 +151,10 @@ EPSILON = 0.9               # Use random action if less than epsilon [0..1]
 EVAL_INTERVAL = 10          # How many episodes of training before evaluation
 RANDOM_SEED = None          # Seed for random number generator, for reproducability, use None for random seed
 NUM_EPISODES = args.episodes if not IN_PYNB else 1000   # Max number of training episodes
+LOG_INTERVAL = 1000
 
-
+# Linearly decay epsilon over this many steps.
+EPSILON_DECAY_PERIOD = 250000
 
 
 
@@ -183,9 +188,11 @@ def get_screen(env):
     # Convert to float, rescale, convert to torch tensor
     # (this doesn't require a copy)
     screen = np.ascontiguousarray(screen, dtype=np.float32) / 255
-    screen = torch.from_numpy(screen)
+    screen = torch.from_numpy(screen).to(DEVICE).unsqueeze(0)
     # Resize, and add a batch dimension (BCHW)
-    return resize(screen).unsqueeze(0).to(DEVICE)
+    screen = F.interpolate(screen, size=(RESIZE_CONST, RESIZE_CONST))
+    return screen
+    #return resize(screen).unsqueeze(0).to(DEVICE)
 
 ### Save the model. Extra information can be added to the end of the filename
 def save_model(model, filename, extras = None):
@@ -282,7 +289,7 @@ class DQN(nn.Module):
         self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=8, stride=4)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
         self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
-        self.fc4 = nn.Linear(7 * 7 * 64, 512)
+        self.fc4 = nn.Linear(6 * 6 * 64, 512)
         self.fc5 = nn.Linear(512, num_actions)
 
     # Called with either one element to determine next action, or a batch
@@ -290,7 +297,6 @@ class DQN(nn.Module):
     def forward(self, x):
         # Expected x shape: NxCxHxW
         # Required input is size 84x84.
-        x = F.interpolate(x, size=(84, 84))
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
@@ -544,8 +550,8 @@ def select_action(state, policy_net, num_actions, epsilon, steps_done = 0, boots
     new_epsilon = epsilon
     if steps_done > bootstrap_threshold:
         steps_after_bootstrap = steps_done - bootstrap_threshold
-        if steps_after_bootstrap % 1000 == 0:
-            new_epsilon = 0.999 * epsilon
+        if steps_after_bootstrap % 100 == 0:
+            new_epsilon = max(EVAL_EPSILON, 0.999 * epsilon)
     if torch.rand(size=(1,)).item() < epsilon:
         # Sample a random action uniformly.
         action = torch.randint(0, num_actions, size=(1,))[:,None].long()
@@ -656,7 +662,7 @@ def doBackprop(loss, parameters):
 ### Take a DQN and do one forward-backward pass.
 ### Since this is Q-learning, we will run a forward pass to get Q-values for state-action pairs and then 
 ### give the true value as the Q-values after the Q-update equation.
-def optimize_model(policy_net, target_net, replay_memory, optimizer, batch_size, gamma):
+def optimize_model(policy_net, target_net, replay_memory, optimizer, batch_size, gamma, writer, steps_done):
     if len(replay_memory) < batch_size:
         return
     ### step 1: sample from the replay memory. Get BATCH_SIZE transitions
@@ -685,6 +691,8 @@ def optimize_model(policy_net, target_net, replay_memory, optimizer, batch_size,
     ### Step 7: Computer Huber loss (smooth L1 loss)
     ###         Compare state action values from step 5 to expected state action values from step 7
     loss = doComputeLoss(state_action_values, expected_state_action_values)
+    if steps_done % LOG_INTERVAL == 0:
+        writer.add_scalar('train/loss', loss.item(), steps_done)
     ### Step 8: Back propagation
     ###         a. Zero out gradients
     ###         b. call loss.backward()
@@ -695,6 +703,7 @@ def optimize_model(policy_net, target_net, replay_memory, optimizer, batch_size,
         optimizer.zero_grad()
         doBackprop(loss, policy_net.parameters())
         optimizer.step()
+
 
 ##########################################################
 ### MAIN
@@ -775,6 +784,10 @@ def train(num_episodes = NUM_EPISODES, load_filename = None, save_filename = Non
             action, epsilon = select_action(state, policy_net, env.NUM_ACTIONS, epsilon, steps_done, bootstrap_threshold)
             steps_done = steps_done + 1
             episode_steps = episode_steps + 1
+            if steps_done % LOG_INTERVAL == 0:
+                writer.add_scalar('train/epsilon', epsilon, steps_done)
+                writer.add_scalar('train/episodes', i_episode, steps_done)
+                writer.add_image('train/screen', state[0,:,:,:], steps_done)
             
             # for debugging
             if RENDER_SCREEN and not IN_PYNB:
@@ -807,7 +820,7 @@ def train(num_episodes = NUM_EPISODES, load_filename = None, save_filename = Non
 
                 # If we are past bootstrapping we should perform one step of the optimization
                 if steps_done > bootstrap_threshold:
-                  optimize_model(policy_net, target_net if target_update > 0 else policy_net, replay_memory, optimizer, batch_size, gamma)
+                  optimize_model(policy_net, target_net if target_update > 0 else policy_net, replay_memory, optimizer, batch_size, gamma, writer, steps_done)
             else:
                 # Do nothing if select_action() is not implemented and returning None
                 env.step(np.array([0]))
@@ -819,6 +832,8 @@ def train(num_episodes = NUM_EPISODES, load_filename = None, save_filename = Non
                 status, _ = episode_status(episode_steps, max_reward)
                 print("result:", status)
                 print("total steps:", steps_done, '\n')
+                writer.add_scalar('train/duration', episode_steps, steps_done)
+                writer.add_scalar('train/max_reward', max_reward, steps_done)
 
             # Should we update the target network?
             if target_update > 0 and i_episode % target_update == 0:
@@ -842,6 +857,8 @@ def train(num_episodes = NUM_EPISODES, load_filename = None, save_filename = Non
             test_average_max_reward = test_average_max_reward / EVAL_COUNT
             print("Average duration:", test_average_duration)
             print("Average max reward:", test_average_max_reward)
+            writer.add_scalar('eval/duration', test_average_duration, steps_done)
+            writer.add_scalar('eval/max_reward', test_average_max_reward, steps_done)
             # If this is the best window average we've seen, save the model
             if test_average_duration < best_eval:
                 best_eval = test_average_duration
@@ -854,6 +871,7 @@ def train(num_episodes = NUM_EPISODES, load_filename = None, save_filename = Non
     print('Training complete')
     if RENDER_SCREEN and not IN_PYNB:
         env.render()
+    writer.close()
     env.close()
     return policy_net
  
