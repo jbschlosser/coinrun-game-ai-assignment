@@ -144,19 +144,18 @@ COIN_REWARD = 100
 # You may want to change these, but is probably not necessary
 BATCH_SIZE = 128            # How many replay experiences to run through neural net at once
 GAMMA = 0.999               # How much to discount the future [0..1]
-BOOTSTRAP = 10000           # How many steps to run to fill up replay memory before training starts
+BOOTSTRAP = 5000            # How many steps to run to fill up replay memory before training starts
 TARGET_UPDATE = 0           # Delays updating the network for loss calculations. 0=don't delay, or 1+ number of episodes
 REPLAY_CAPACITY = 10000     # How big is the replay memory
-EPSILON = 0.9               # Use random action if less than epsilon [0..1]
+EPSILON = 1.0               # Use random action if less than epsilon [0..1]
 EVAL_INTERVAL = 10          # How many episodes of training before evaluation
 RANDOM_SEED = None          # Seed for random number generator, for reproducability, use None for random seed
 NUM_EPISODES = args.episodes if not IN_PYNB else 1000   # Max number of training episodes
-LOG_INTERVAL = 1000
+LOG_INTERVAL = 100
 
-# Linearly decay epsilon from start -> end over some number of steps.
-EPSILON_DECAY_PERIOD = 150000
-EPSILON_START = 0.9
-EPSILON_END = 0.1
+# Linearly decay epsilon from start -> end.
+EPSILON_DELTA = 1e-4
+EPSILON_END = 0.01
 
 ############################################################
 ### HELPERS
@@ -188,11 +187,12 @@ def get_screen(env):
     # Convert to float, rescale, convert to torch tensor
     # (this doesn't require a copy)
     screen = np.ascontiguousarray(screen, dtype=np.float32) / 255
-    screen = torch.from_numpy(screen).to(DEVICE).unsqueeze(0)
     # Resize, and add a batch dimension (BCHW)
+    #screen = torch.from_numpy(screen)
+    #return resize(screen).unsqueeze(0).to(DEVICE)
+    screen = torch.from_numpy(screen).to(DEVICE).unsqueeze(0)
     screen = F.interpolate(screen, size=(RESIZE_CONST, RESIZE_CONST))
     return screen
-    #return resize(screen).unsqueeze(0).to(DEVICE)
 
 ### Save the model. Extra information can be added to the end of the filename
 def save_model(model, filename, extras = None):
@@ -286,22 +286,30 @@ class DQN(nn.Module):
     def __init__(self, h, w, num_actions):
         super(DQN, self).__init__()
         in_channels = 3 # Single RGB frame
-        self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=8, stride=4)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
-        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
-        self.fc4 = nn.Linear(6 * 6 * 64, 512)
-        self.fc5 = nn.Linear(512, num_actions)
+        self.trunk = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=8, stride=4),
+            nn.Dropout2d(p=0.2),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.Dropout2d(p=0.2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.Dropout2d(p=0.2),
+            nn.ReLU()
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(6 * 6 * 64, 512),
+            nn.ReLU(),
+            nn.Linear(512, num_actions)
+        )
 
     # Called with either one element to determine next action, or a batch
     # during optimization. Returns tensor([[left0exp,right0exp]...]).
     def forward(self, x):
         # Expected x shape: NxCxHxW
-        # Required input is size 84x84.
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        x = F.relu(self.fc4(x.view(x.size(0), -1)))
-        q_values = self.fc5(x)
+        # Required input image size is 84x84.
+        x = self.trunk(x)
+        q_values = self.classifier(x.view(x.shape[0], -1))
         return q_values
 
 ##########################################################
@@ -529,7 +537,7 @@ def unit_test():
 ### Output:
 ### - the optimizer object
 def initializeOptimizer(parameters):
-    optimizer = torch.optim.Adam(parameters)
+    optimizer = torch.optim.Adam(parameters, lr=1e-4, weight_decay=1e-2)
     return optimizer
 
 ### Select an action to perform. 
@@ -549,8 +557,7 @@ def select_action(state, policy_net, num_actions, epsilon, steps_done = 0, boots
     action = None
     new_epsilon = epsilon
     if steps_done > bootstrap_threshold:
-        frac_done = min(1, (steps_done - bootstrap_threshold) / EPSILON_DECAY_PERIOD)
-        new_epsilon = (1 - frac_done) * EPSILON_START + frac_done * EPSILON_END
+        new_epsilon = max(EPSILON_END, epsilon - EPSILON_DELTA)
     if torch.rand(size=(1,)).item() < epsilon:
         # Sample a random action uniformly.
         action = torch.randint(0, num_actions, size=(1,))[:,None].long()
@@ -599,10 +606,8 @@ def doMakeBatch(replay_memory, batch_size):
 ### Output:
 ### - A tensor of shape batch_size x 1 containing the Q-value predicted by the DQN in the position indicated by the action
 def doPredictQValues(policy_net, states_batch, actions_batch):
-    q_value = policy_net(states_batch)
-    choose_all = torch.arange(0, q_value.shape[0], device=DEVICE).long()
-    select_action = actions_batch.long().view(-1)
-    state_action_values = q_value[choose_all, select_action][:,None]
+    q_values = policy_net(states_batch)
+    state_action_values = torch.gather(q_values, 1, actions_batch.long())
     return state_action_values
 
 ### Ask the policy_net to predict the utility of a next_state.
@@ -649,10 +654,8 @@ def doComputeLoss(state_action_values, expected_state_action_values):
 ### There is no output
 def doBackprop(loss, parameters):
     loss.backward()
-    # Do gradient clipping.
-    for parameter in parameters:
-        parameter.grad.clamp_(-1, 1)
-
+    # Do gradient clipping based on the global norm.
+    torch.nn.utils.clip_grad_norm_(parameters, 0.1)
 
 
 #########################################################
