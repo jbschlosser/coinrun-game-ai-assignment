@@ -952,6 +952,6 @@ if __name__== "__main__":
                 for _ in range(EVAL_COUNT):
                     evaluate(eval_net, EVAL_EPSILON)
         else:
-            policy_net = train()
+            policy_net = train(save_filename=SAVE_FILENAME)
             for _ in range(EVAL_COUNT):
                 evaluate(policy_net, EVAL_EPSILON)
