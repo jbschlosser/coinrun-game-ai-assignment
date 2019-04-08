@@ -953,7 +953,7 @@ def evaluate(policy_net, epsilon = EVAL_EPSILON, env = None):
     print("result:", status, '\n')
     if RENDER_SCREEN and not IN_PYNB:
         env.render()
-    return steps_done, max_reward
+    return steps_done if status == 'coin' else 1002, max_reward
 
 
 
@@ -965,8 +965,11 @@ if __name__== "__main__":
             if args.load is not None and os.path.isfile(os.path.join(MODEL_PATH, args.load)):
                 eval_net = load_model(args.load) 
                 print(eval_net)
+                durations = []
                 for _ in range(EVAL_COUNT):
-                    evaluate(eval_net, EVAL_EPSILON)
+                    duration, _ = evaluate(eval_net, EVAL_EPSILON)
+                    durations.append(duration)
+                print('Average:', np.mean(durations))
         else:
             policy_net = train(save_filename=SAVE_FILENAME)
             for _ in range(EVAL_COUNT):
