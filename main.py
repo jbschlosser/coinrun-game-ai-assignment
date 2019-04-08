@@ -245,12 +245,19 @@ def episode_status(duration, reward):
 ###    capacity: (int) number of transitions that can be stored
 ###    memory: (array) holds transitions (state, action, next_state, reward)
 ###    position: (int) index of current location in memory to place the next transition.
+
 class ReplayMemory(object):
 
     def __init__(self, capacity):
         self.capacity = capacity
         self.memory = []
-        self.position = 0
+        # Hard-code bins for storing samples.
+        # Format: position, capacity, list
+        NBINS = 3
+        portion = self.capacity // NBINS
+        caps = [portion for _ in range(NBINS - 1)]
+        caps.append(self.capacity - sum(caps))
+        self.memory = [(0, caps[i], []) for i in range(NBINS)]
 
     ### Store a transition in memory.
     ### To implement: put new items at the end of the memory array, unless capacity is reached.
@@ -262,19 +269,37 @@ class ReplayMemory(object):
                            action=action,
                            next_state=next_state,
                            reward=reward)
-        if(len(self.memory) == self.capacity):
-            self.memory[self.position] = trans
-            self.position = (self.position + 1) % self.capacity
+        # Store transaction in the correct bin.
+        bin_idx = 0
+        rewval = reward.item()
+        if rewval < 2.0: bin_idx = 2
+        elif rewval < 10.0: bin_idx = 1
+        else: bin_idx = 0
+        position, capacity, memory = self.memory[bin_idx]
+        if(len(memory) == capacity):
+            memory[position] = trans
+            position = (position + 1) % capacity
         else:
-            self.memory.append(trans)
+            memory.append(trans)
+        self.memory[bin_idx] = (position, capacity, memory)
 
     ### Return a batch of transition objects from memory containing batch_size elements.
     def sample(self, batch_size):
-        return random.sample(self.memory, batch_size)
+        nbins = len(self.memory)
+        portion = batch_size // nbins
+        choose = [portion for _ in range(nbins - 1)]
+        choose.append(batch_size - sum(choose))
+        samples = []
+        for bin_idx, num in enumerate(choose):
+            _, _, mem = self.memory[bin_idx]
+            picks = np.random.choice(len(mem), size=num, replace=True)
+            samples.extend([mem[p] for p in picks])
+        return samples
 
     ### This allows one to call len() on a ReplayMemory object. E.g. len(replay_memory)
     def __len__(self):
-        return len(self.memory)
+        length = sum([len(mem) for pos, cap, mem in self.memory])
+        return length
 
 ##########################################################
 ### DQN
