@@ -953,7 +953,7 @@ def evaluate(policy_net, epsilon = EVAL_EPSILON, env = None):
     print("result:", status, '\n')
     if RENDER_SCREEN and not IN_PYNB:
         env.render()
-    return steps_done if status == 'coin' else 1002, max_reward
+    return steps_done, max_reward
 
 
 
