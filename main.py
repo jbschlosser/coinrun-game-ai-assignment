@@ -971,6 +971,6 @@ if __name__== "__main__":
                     durations.append(duration)
                 print('Average:', np.mean(durations))
         else:
-            policy_net = train(save_filename=SAVE_FILENAME)
+            policy_net = train(save_filename=SAVE_FILENAME, load_filename=LOAD_FILENAME)
             for _ in range(EVAL_COUNT):
                 evaluate(policy_net, EVAL_EPSILON)
