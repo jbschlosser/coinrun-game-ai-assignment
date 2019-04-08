@@ -145,7 +145,7 @@ COIN_REWARD = 100
 BATCH_SIZE = 128            # How many replay experiences to run through neural net at once
 GAMMA = 0.999               # How much to discount the future [0..1]
 BOOTSTRAP = 5000            # How many steps to run to fill up replay memory before training starts
-TARGET_UPDATE = 0           # Delays updating the network for loss calculations. 0=don't delay, or 1+ number of episodes
+TARGET_UPDATE = 2           # Delays updating the network for loss calculations. 0=don't delay, or 1+ number of episodes
 REPLAY_CAPACITY = 10000     # How big is the replay memory
 EPSILON = 1.0               # Use random action if less than epsilon [0..1]
 EVAL_INTERVAL = 10          # How many episodes of training before evaluation
@@ -155,7 +155,7 @@ LOG_INTERVAL = 100
 
 # Linearly decay epsilon from start -> end.
 EPSILON_DELTA = 1e-4
-EPSILON_END = 0.01
+EPSILON_END = 0.1
 
 ############################################################
 ### HELPERS
@@ -191,7 +191,8 @@ def get_screen(env):
     #screen = torch.from_numpy(screen)
     #return resize(screen).unsqueeze(0).to(DEVICE)
     screen = torch.from_numpy(screen).to(DEVICE).unsqueeze(0)
-    screen = F.interpolate(screen, size=(RESIZE_CONST, RESIZE_CONST))
+    SIZE = 80
+    screen = F.interpolate(screen, size=(SIZE, SIZE))
     return screen
 
 ### Save the model. Extra information can be added to the end of the filename
@@ -288,24 +289,39 @@ class DQN(nn.Module):
         in_channels = 3 # Single RGB frame
         self.trunk = nn.Sequential(
             nn.Conv2d(in_channels, 32, kernel_size=8, stride=4),
-            nn.Dropout2d(p=0.2),
+            nn.BatchNorm2d(32),
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=4, stride=2),
-            nn.Dropout2d(p=0.2),
+            nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.Conv2d(64, 64, kernel_size=3, stride=1),
-            nn.Dropout2d(p=0.2),
+            nn.BatchNorm2d(64),
             nn.ReLU()
         )
         self.classifier = nn.Sequential(
             nn.Linear(6 * 6 * 64, 512),
             nn.ReLU(),
+            nn.Dropout(p=0.5),
             nn.Linear(512, num_actions)
         )
 
     # Called with either one element to determine next action, or a batch
     # during optimization. Returns tensor([[left0exp,right0exp]...]).
     def forward(self, x):
+        def switch_bn_and_dropout(should_train):
+            def _switch_bn_and_dropout(m):
+                if type(m) == nn.BatchNorm2d or type(m) == nn.Dropout:
+                    if should_train: m.train()
+                    else: m.eval()
+            return _switch_bn_and_dropout
+        switch_to_train = switch_bn_and_dropout(True)
+        switch_to_eval = switch_bn_and_dropout(False)
+        if x.shape[0] == 1:
+            self.trunk.apply(switch_to_eval)
+            self.classifier.apply(switch_to_eval)
+        else:
+            self.trunk.apply(switch_to_train)
+            self.classifier.apply(switch_to_train)
         # Expected x shape: NxCxHxW
         # Required input image size is 84x84.
         x = self.trunk(x)
@@ -537,7 +553,7 @@ def unit_test():
 ### Output:
 ### - the optimizer object
 def initializeOptimizer(parameters):
-    optimizer = torch.optim.Adam(parameters, lr=1e-4, weight_decay=1e-2)
+    optimizer = torch.optim.Adam(parameters, weight_decay=1e-4)
     return optimizer
 
 ### Select an action to perform. 
@@ -837,9 +853,9 @@ def train(num_episodes = NUM_EPISODES, load_filename = None, save_filename = Non
                 writer.add_scalar('train/duration', episode_steps, steps_done)
                 writer.add_scalar('train/max_reward', max_reward, steps_done)
 
-            # Should we update the target network?
-            if target_update > 0 and i_episode % target_update == 0:
-                target_net.load_state_dict(policy_net.state_dict())
+        # Should we update the target network?
+        if target_update > 0 and i_episode % target_update == 0:
+            target_net.load_state_dict(policy_net.state_dict())
                 
         # Should we evaluate?
         if steps_done > bootstrap_threshold and i_episode > 0 and i_episode % eval_interval == 0:
