@@ -159,7 +159,7 @@ LOG_INTERVAL = 100
 # Linearly decay epsilon from start -> end.
 EPSILON_START = 1.0
 EPSILON_END = 0.1
-EPSILON_DECAY_PERIOD = 50000
+EPSILON_DECAY_PERIOD = 10000
 EPSILON_DELTA = (EPSILON_START - EPSILON_END) / EPSILON_DECAY_PERIOD
 
 ############################################################
@@ -627,10 +627,15 @@ def select_action(state, policy_net, num_actions, epsilon, steps_done = 0, boots
         log_entries['q_value' + str(i)] = q
     if torch.rand(size=(1,)).item() < epsilon:
         # Sample a random action uniformly.
-        action = torch.randint(0, num_actions, size=(1,))[:,None].long()
+        action = (torch.randint(0, 2, size=(1,)) * 2 + 1)[:,None].long()
+        #action = torch.randint(0, num_actions, size=(1,))[:,None].long()
         log_entries['choice'] = 'random'
     else:
-        action = torch.argmax(q_vals, dim=1)[:,None].long()
+        #action = torch.argmax(q_vals, dim=1)[:,None].long()
+        one = q_vals[0,1].item()
+        three = q_vals[0,3].item()
+        if one > three: action = torch.tensor([[1]], device=DEVICE).long()
+        else: action = torch.tensor([[3]], device=DEVICE).long()
         log_entries['choice'] = 'policy'
     log_entries['action'] = action.item()
     return action, new_epsilon
