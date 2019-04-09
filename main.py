@@ -25,6 +25,7 @@ from PIL import Image
 # pip install torch
 # pip install torchvision
 
+from collections import OrderedDict
 from coinrun import setup_utils, make
 import coinrun.main_utils as utils
 from coinrun.config import Config
@@ -32,6 +33,7 @@ if not IN_PYNB:
     from gym.envs.classic_control import rendering
 from coinrun import policies, wrappers
 
+import superlogger
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -115,6 +117,7 @@ if not IN_PYNB:
 
 
 writer = SummaryWriter(log_dir=args.model_path)
+logger = superlogger.LogWriter(args.model_path)
 
 ###########################################################
 ### CONSTANTS
@@ -143,7 +146,7 @@ COIN_REWARD = 100
 
 # You may want to change these, but is probably not necessary
 BATCH_SIZE = 128            # How many replay experiences to run through neural net at once
-GAMMA = 0.999               # How much to discount the future [0..1]
+GAMMA = 0.99               # How much to discount the future [0..1]
 BOOTSTRAP = 5000            # How many steps to run to fill up replay memory before training starts
 TARGET_UPDATE = 2           # Delays updating the network for loss calculations. 0=don't delay, or 1+ number of episodes
 REPLAY_CAPACITY = 10000     # How big is the replay memory
@@ -154,8 +157,10 @@ NUM_EPISODES = args.episodes if not IN_PYNB else 1000   # Max number of training
 LOG_INTERVAL = 100
 
 # Linearly decay epsilon from start -> end.
-EPSILON_DELTA = 1e-4
+EPSILON_START = 1.0
 EPSILON_END = 0.1
+EPSILON_DECAY_PERIOD = 50000
+EPSILON_DELTA = (EPSILON_START - EPSILON_END) / EPSILON_DECAY_PERIOD
 
 ############################################################
 ### HELPERS
@@ -166,6 +171,7 @@ Transition = namedtuple('Transition',
 
 ### Function for resizing the screen
 resize = T.Compose([T.ToPILImage(),
+                    T.Grayscale(),
                     T.Resize(RESIZE_CONST, interpolation=Image.CUBIC),
                     T.ToTensor()])
 
@@ -177,7 +183,9 @@ def printAllTensors():
 
 ### Take the environment and return a tensor containing screen data as a 3D tensor containing (color, height, width) information.
 ### Optional: the screen may be manipulated, for example, it could be cropped
-def get_screen(env):
+SIZE = 80
+FRAMESTACK = 4
+def get_screen(env, screens = [torch.zeros(1, 1, SIZE, SIZE).to(DEVICE) for _ in range(FRAMESTACK)]):
     # Returned screen requested by gym is 512x512x3. Transpose it into torch order (Color, Height, Width).
     screen = env.render(mode='rgb_array').transpose((2, 0, 1))
     _, screen_height, screen_width = screen.shape
@@ -188,12 +196,16 @@ def get_screen(env):
     # (this doesn't require a copy)
     screen = np.ascontiguousarray(screen, dtype=np.float32) / 255
     # Resize, and add a batch dimension (BCHW)
-    #screen = torch.from_numpy(screen)
-    #return resize(screen).unsqueeze(0).to(DEVICE)
+    # screen = torch.from_numpy(screen)
+    # screen = resize(screen).unsqueeze(0).to(DEVICE)
     screen = torch.from_numpy(screen).to(DEVICE).unsqueeze(0)
-    SIZE = 80
     screen = F.interpolate(screen, size=(SIZE, SIZE))
-    return screen
+    gray_or_grey = torch.tensor([0.21, 0.72, 0.07]).to(DEVICE).view(1, 3, 1, 1)
+    screen *= gray_or_grey
+    screen = torch.sum(screen, dim=1, keepdim=True)
+    screens.pop(0)
+    screens.append(screen)
+    return torch.cat(screens, dim=1)
 
 ### Save the model. Extra information can be added to the end of the filename
 def save_model(model, filename, extras = None):
@@ -284,16 +296,26 @@ class ReplayMemory(object):
         self.memory[bin_idx] = (position, capacity, memory)
 
     ### Return a batch of transition objects from memory containing batch_size elements.
-    def sample(self, batch_size):
+    def sample(self, batch_size, log_entries = {}):
         nbins = len(self.memory)
         portion = batch_size // nbins
         choose = [portion for _ in range(nbins - 1)]
         choose.append(batch_size - sum(choose))
         samples = []
-        for bin_idx, num in enumerate(choose):
-            _, _, mem = self.memory[bin_idx]
-            picks = np.random.choice(len(mem), size=num, replace=True)
-            samples.extend([mem[p] for p in picks])
+        sampled = [0 for _ in range(nbins)]
+        inmem = [len(mem) for _,_,mem in self.memory]
+        while len(samples) < batch_size:
+            for bin_idx, num in enumerate(choose):
+                _, _, mem = self.memory[bin_idx]
+                if len(mem) == 0: continue
+                to_pick = min(num, batch_size - len(samples))
+                if to_pick == 0: break
+                sampled[bin_idx] += to_pick
+                picks = np.random.choice(len(mem), size=to_pick, replace=True)
+                samples.extend([mem[p] for p in picks])
+        for i, (s, im) in enumerate(zip(sampled, inmem)):
+            log_entries['bin' + str(i) + '_sampled'] = s
+            log_entries['bin' + str(i) + '_total'] = im
         return samples
 
     ### This allows one to call len() on a ReplayMemory object. E.g. len(replay_memory)
@@ -311,16 +333,16 @@ class DQN(nn.Module):
     ### automatically when forward() is called.
     def __init__(self, h, w, num_actions):
         super(DQN, self).__init__()
-        in_channels = 3 # Single RGB frame
+        in_channels = 4 # Framestacking of grayscale frames
         self.trunk = nn.Sequential(
             nn.Conv2d(in_channels, 32, kernel_size=8, stride=4),
-            nn.BatchNorm2d(32),
+            nn.Dropout2d(p=0.2),
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=4, stride=2),
-            nn.BatchNorm2d(64),
+            nn.Dropout2d(p=0.2),
             nn.ReLU(),
             nn.Conv2d(64, 64, kernel_size=3, stride=1),
-            nn.BatchNorm2d(64),
+            nn.Dropout2d(p=0.2),
             nn.ReLU()
         )
         self.classifier = nn.Sequential(
@@ -342,8 +364,8 @@ class DQN(nn.Module):
         switch_to_train = switch_bn_and_dropout(True)
         switch_to_eval = switch_bn_and_dropout(False)
         if x.shape[0] == 1:
-            self.trunk.apply(switch_to_eval)
-            self.classifier.apply(switch_to_eval)
+            self.trunk.apply(switch_to_train)
+            self.classifier.apply(switch_to_train)
         else:
             self.trunk.apply(switch_to_train)
             self.classifier.apply(switch_to_train)
@@ -578,7 +600,7 @@ def unit_test():
 ### Output:
 ### - the optimizer object
 def initializeOptimizer(parameters):
-    optimizer = torch.optim.Adam(parameters, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(parameters, lr=1e-4, weight_decay=1e-4)
     return optimizer
 
 ### Select an action to perform. 
@@ -594,17 +616,23 @@ def initializeOptimizer(parameters):
 ### This function should return:
 ### - A tensor of shape 1 x 1 that contains the number of the action to execute
 ### - The new epsilon value to use next time
-def select_action(state, policy_net, num_actions, epsilon, steps_done = 0, bootstrap_threshold = 0):
+def select_action(state, policy_net, num_actions, epsilon, steps_done = 0, bootstrap_threshold = 0, log_entries = {}):
     action = None
     new_epsilon = epsilon
     if steps_done > bootstrap_threshold:
         new_epsilon = max(EPSILON_END, epsilon - EPSILON_DELTA)
+    q_vals = policy_net(state)
+    qs = q_vals[0].detach().cpu().numpy()
+    for i, q in enumerate(qs):
+        log_entries['q_value' + str(i)] = q
     if torch.rand(size=(1,)).item() < epsilon:
         # Sample a random action uniformly.
         action = torch.randint(0, num_actions, size=(1,))[:,None].long()
+        log_entries['choice'] = 'random'
     else:
-        # Use the policy network to pick an action.
-        action = torch.argmax(policy_net(state), dim=1)[:,None].long()
+        action = torch.argmax(q_vals, dim=1)[:,None].long()
+        log_entries['choice'] = 'policy'
+    log_entries['action'] = action.item()
     return action, new_epsilon
 
 ### Ask for a batch of experience replays.
@@ -617,9 +645,9 @@ def select_action(state, policy_net, num_actions, epsilon, steps_done = 0, boots
 ### - next_states_batch: a tensor containing screens. 
 ### - rewards_batch: a tensor of shape batch_size x 1 containing reward values.
 ### - non_final_mask: a tensor of bytes of length batch_size containing a 0 if the state is terminal or 1 otherwise
-def doMakeBatch(replay_memory, batch_size):
+def doMakeBatch(replay_memory, batch_size, log_entries={}):
     assert batch_size > 0
-    samples = replay_memory.sample(batch_size)
+    samples = replay_memory.sample(batch_size, log_entries)
     first = samples[0]
     states_batch = torch.empty((batch_size, *first.state.shape[1:]), device=DEVICE)
     actions_batch = torch.empty((batch_size, 1), device=DEVICE).long()
@@ -705,7 +733,7 @@ def doBackprop(loss, parameters):
 ### Take a DQN and do one forward-backward pass.
 ### Since this is Q-learning, we will run a forward pass to get Q-values for state-action pairs and then 
 ### give the true value as the Q-values after the Q-update equation.
-def optimize_model(policy_net, target_net, replay_memory, optimizer, batch_size, gamma, writer, steps_done):
+def optimize_model(policy_net, target_net, replay_memory, optimizer, batch_size, gamma, writer, log_entries, steps_done):
     if len(replay_memory) < batch_size:
         return
     ### step 1: sample from the replay memory. Get BATCH_SIZE transitions
@@ -718,7 +746,7 @@ def optimize_model(policy_net, target_net, replay_memory, optimizer, batch_size,
     ###         a. Create a tensor of shape [BATCH_SIZE, color(3), height, width] holding states
     ###         b. Create a tensor of shape [BATCH_SIZE, 1] holding actions
     ###         c. Create a tensor of shape [BATCH_SIZE, 1] holding rewards
-    states_batch, actions_batch, next_states_batch, rewards_batch, non_final_mask = doMakeBatch(replay_memory, batch_size)
+    states_batch, actions_batch, next_states_batch, rewards_batch, non_final_mask = doMakeBatch(replay_memory, batch_size, log_entries)
 
     ### Step 4: Get the action values predicted.
     ###         a. Call policy_net(state_batch) to get a tensor of shape [BATCH_SIZE, NUM_ACTIONS] containing Q-values
@@ -736,6 +764,7 @@ def optimize_model(policy_net, target_net, replay_memory, optimizer, batch_size,
     loss = doComputeLoss(state_action_values, expected_state_action_values)
     if steps_done % LOG_INTERVAL == 0:
         writer.add_scalar('train/loss', loss.item(), steps_done)
+    log_entries['loss'] = loss.item()
     ### Step 8: Back propagation
     ###         a. Zero out gradients
     ###         b. call loss.backward()
@@ -823,8 +852,14 @@ def train(num_episodes = NUM_EPISODES, load_filename = None, save_filename = Non
 
         # Do forever until the loop breaks
         while not done:
+            log_entries = OrderedDict()
+            log_entries['epsilon'] = epsilon
+            log_entries['episode'] = i_episode
+            for i in range(state.shape[1]):
+                log_entries['screen' + str(i)] = state[0,i,:,:].detach().cpu().numpy()
             # Select and perform an action
-            action, epsilon = select_action(state, policy_net, env.NUM_ACTIONS, epsilon, steps_done, bootstrap_threshold)
+            action, epsilon = select_action(state, policy_net, env.NUM_ACTIONS, epsilon, steps_done, bootstrap_threshold, log_entries)
+            log_entries['new_epsilon'] = epsilon
             steps_done = steps_done + 1
             episode_steps = episode_steps + 1
             if steps_done % LOG_INTERVAL == 0:
@@ -842,6 +877,8 @@ def train(num_episodes = NUM_EPISODES, load_filename = None, save_filename = Non
 
                 # Record if this was the best reward we've seen so far
                 max_reward = max(reward, max_reward)
+                log_entries['reward'] = reward[0]
+                log_entries['max_reward'] = max_reward[0]
                 
                 # Turn the reward into a tensor  
                 reward = torch.tensor([reward], device=DEVICE)
@@ -862,8 +899,13 @@ def train(num_episodes = NUM_EPISODES, load_filename = None, save_filename = Non
                 state = next_state
 
                 # If we are past bootstrapping we should perform one step of the optimization
+                log_entries['loss'] = np.nan
+                for i in range(3):
+                    log_entries['bin' + str(i) + '_sampled'] = np.nan
+                    log_entries['bin' + str(i) + '_total'] = np.nan
                 if steps_done > bootstrap_threshold:
-                  optimize_model(policy_net, target_net if target_update > 0 else policy_net, replay_memory, optimizer, batch_size, gamma, writer, steps_done)
+                    optimize_model(policy_net, target_net if target_update > 0 else policy_net, replay_memory, optimizer, batch_size, gamma, writer, log_entries, steps_done)
+                logger.log(log_entries)
             else:
                 # Do nothing if select_action() is not implemented and returning None
                 env.step(np.array([0]))
@@ -891,7 +933,7 @@ def train(num_episodes = NUM_EPISODES, load_filename = None, save_filename = Non
             # Evaluate 10 times
             for _ in range(EVAL_COUNT):
                 # Call the evaluation function
-                test_duration, test_max_reward = evaluate(eval_net, eval_epsilon, env)
+                test_duration, test_max_reward = evaluate(policy_net, eval_epsilon, env)
                 status, score = episode_status(test_duration, test_max_reward)
                 test_duration = score # Set test_duration to score to factor in death-penalty
                 test_average_duration = test_average_duration + test_duration
@@ -949,12 +991,18 @@ def evaluate(policy_net, epsilon = EVAL_EPSILON, env = None):
     steps_done = 0         # Number of steps executed
     max_reward = 0         # Max reward seen
     done = False           # Is the game over?
+    logger = superlogger.LogWriter(args.model_path + '/eval')
 
     print("Evaluating...")
     while not done:
         # Select and perform an action
-        action, _ = select_action(state, policy_net, env.NUM_ACTIONS, epsilon, steps_done=0, bootstrap_threshold=0)
+        log_entries = OrderedDict()
+        log_entries['epsilon'] = epsilon
+        for i in range(state.shape[1]):
+            log_entries['screen' + str(i)] = state[0,i,:,:].detach().cpu().numpy()
+        action, _ = select_action(state, policy_net, env.NUM_ACTIONS, epsilon, steps_done=0, bootstrap_threshold=0, log_entries=log_entries)
         steps_done = steps_done + 1
+        log_entries['steps_done'] = steps_done
 
         if RENDER_SCREEN and not IN_PYNB:
             env.render()
@@ -965,12 +1013,15 @@ def evaluate(policy_net, epsilon = EVAL_EPSILON, env = None):
 
             # Is this the best reward we've seen?
             max_reward = max(reward, max_reward)
+            log_entries['reward'] = reward[0]
+            log_entries['max_reward'] = max_reward[0]
 
             # Observe new state
             state = get_screen(env)
         else:
             # Do nothing if select_action() is not implemented and returning None
             env.step(np.array([0]))
+        logger.log(log_entries)
 
     print("duration:", steps_done)
     print("max reward:", max_reward)
