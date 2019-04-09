@@ -265,7 +265,7 @@ class ReplayMemory(object):
         self.memory = []
         # Hard-code bins for storing samples.
         # Format: position, capacity, list
-        NBINS = 3
+        NBINS = 1
         portion = self.capacity // NBINS
         caps = [portion for _ in range(NBINS - 1)]
         caps.append(self.capacity - sum(caps))
@@ -284,9 +284,9 @@ class ReplayMemory(object):
         # Store transaction in the correct bin.
         bin_idx = 0
         rewval = reward.item()
-        if rewval < 2.0: bin_idx = 2
-        elif rewval < 10.0: bin_idx = 1
-        else: bin_idx = 0
+        # if rewval < 2.0: bin_idx = 2
+        # elif rewval < 10.0: bin_idx = 1
+        # else: bin_idx = 0
         position, capacity, memory = self.memory[bin_idx]
         if(len(memory) == capacity):
             memory[position] = trans
@@ -600,7 +600,7 @@ def unit_test():
 ### Output:
 ### - the optimizer object
 def initializeOptimizer(parameters):
-    optimizer = torch.optim.Adam(parameters, lr=1e-4, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(parameters)
     return optimizer
 
 ### Select an action to perform. 
