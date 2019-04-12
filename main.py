@@ -25,7 +25,6 @@ from PIL import Image
 # pip install torch
 # pip install torchvision
 
-from collections import OrderedDict
 from coinrun import setup_utils, make
 import coinrun.main_utils as utils
 from coinrun.config import Config
@@ -33,7 +32,6 @@ if not IN_PYNB:
     from gym.envs.classic_control import rendering
 from coinrun import policies, wrappers
 
-import superlogger
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -43,7 +41,11 @@ import torchvision.transforms as T
 import os
 import argparse
 import pdb
+
+# Logging imports.
+import superlogger
 from tensorboardX import SummaryWriter
+from collections import OrderedDict
 
 
 ###########################################################
@@ -127,7 +129,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print('Using device:', DEVICE)
 
 # Resize the screen to this
-RESIZE_CONST = 80
+RESIZE_CONST = 40 
 
 # Defaults
 RENDER_SCREEN = args.render if not IN_PYNB else False
@@ -148,7 +150,7 @@ COIN_REWARD = 100
 BATCH_SIZE = 128            # How many replay experiences to run through neural net at once
 GAMMA = 0.99               # How much to discount the future [0..1]
 BOOTSTRAP = 5000            # How many steps to run to fill up replay memory before training starts
-TARGET_UPDATE = 2           # Delays updating the network for loss calculations. 0=don't delay, or 1+ number of episodes
+TARGET_UPDATE = 0           # Delays updating the network for loss calculations. 0=don't delay, or 1+ number of episodes
 REPLAY_CAPACITY = 10000     # How big is the replay memory
 EPSILON = 1.0               # Use random action if less than epsilon [0..1]
 EVAL_INTERVAL = 10          # How many episodes of training before evaluation
@@ -159,7 +161,7 @@ LOG_INTERVAL = 100
 # Linearly decay epsilon from start -> end.
 EPSILON_START = 1.0
 EPSILON_END = 0.1
-EPSILON_DECAY_PERIOD = 10000
+EPSILON_DECAY_PERIOD = 50000
 EPSILON_DELTA = (EPSILON_START - EPSILON_END) / EPSILON_DECAY_PERIOD
 
 ############################################################
@@ -171,21 +173,12 @@ Transition = namedtuple('Transition',
 
 ### Function for resizing the screen
 resize = T.Compose([T.ToPILImage(),
-                    T.Grayscale(),
                     T.Resize(RESIZE_CONST, interpolation=Image.CUBIC),
                     T.ToTensor()])
 
-def printAllTensors():
-    import gc
-    for obj in gc.get_objects():
-        if torch.is_tensor(obj) or (hasattr(obj, 'data') and torch.is_tensor(obj.data)):
-            print(obj.type(), obj.size())
-
 ### Take the environment and return a tensor containing screen data as a 3D tensor containing (color, height, width) information.
 ### Optional: the screen may be manipulated, for example, it could be cropped
-SIZE = 80
-FRAMESTACK = 4
-def get_screen(env, screens = [torch.zeros(1, 1, SIZE, SIZE).to(DEVICE) for _ in range(FRAMESTACK)]):
+def get_screen(env):
     # Returned screen requested by gym is 512x512x3. Transpose it into torch order (Color, Height, Width).
     screen = env.render(mode='rgb_array').transpose((2, 0, 1))
     _, screen_height, screen_width = screen.shape
@@ -195,17 +188,10 @@ def get_screen(env, screens = [torch.zeros(1, 1, SIZE, SIZE).to(DEVICE) for _ in
     # Convert to float, rescale, convert to torch tensor
     # (this doesn't require a copy)
     screen = np.ascontiguousarray(screen, dtype=np.float32) / 255
+    screen = torch.from_numpy(screen).unsqueeze(0).to(DEVICE)
+    screen = F.interpolate(screen, (80, 80))
     # Resize, and add a batch dimension (BCHW)
-    # screen = torch.from_numpy(screen)
-    # screen = resize(screen).unsqueeze(0).to(DEVICE)
-    screen = torch.from_numpy(screen).to(DEVICE).unsqueeze(0)
-    screen = F.interpolate(screen, size=(SIZE, SIZE))
-    gray_or_grey = torch.tensor([0.21, 0.72, 0.07]).to(DEVICE).view(1, 3, 1, 1)
-    screen *= gray_or_grey
-    screen = torch.sum(screen, dim=1, keepdim=True)
-    screens.pop(0)
-    screens.append(screen)
-    return torch.cat(screens, dim=1)
+    return screen
 
 ### Save the model. Extra information can be added to the end of the filename
 def save_model(model, filename, extras = None):
@@ -263,13 +249,7 @@ class ReplayMemory(object):
     def __init__(self, capacity):
         self.capacity = capacity
         self.memory = []
-        # Hard-code bins for storing samples.
-        # Format: position, capacity, list
-        NBINS = 1
-        portion = self.capacity // NBINS
-        caps = [portion for _ in range(NBINS - 1)]
-        caps.append(self.capacity - sum(caps))
-        self.memory = [(0, caps[i], []) for i in range(NBINS)]
+        self.position = 0
 
     ### Store a transition in memory.
     ### To implement: put new items at the end of the memory array, unless capacity is reached.
@@ -281,47 +261,19 @@ class ReplayMemory(object):
                            action=action,
                            next_state=next_state,
                            reward=reward)
-        # Store transaction in the correct bin.
-        bin_idx = 0
-        rewval = reward.item()
-        # if rewval < 2.0: bin_idx = 2
-        # elif rewval < 10.0: bin_idx = 1
-        # else: bin_idx = 0
-        position, capacity, memory = self.memory[bin_idx]
-        if(len(memory) == capacity):
-            memory[position] = trans
-            position = (position + 1) % capacity
+        if(len(self.memory) == self.capacity):
+            self.memory[self.position] = trans
+            self.position = (self.position + 1) % self.capacity
         else:
-            memory.append(trans)
-        self.memory[bin_idx] = (position, capacity, memory)
+            self.memory.append(trans)
 
     ### Return a batch of transition objects from memory containing batch_size elements.
-    def sample(self, batch_size, log_entries = {}):
-        nbins = len(self.memory)
-        portion = batch_size // nbins
-        choose = [portion for _ in range(nbins - 1)]
-        choose.append(batch_size - sum(choose))
-        samples = []
-        sampled = [0 for _ in range(nbins)]
-        inmem = [len(mem) for _,_,mem in self.memory]
-        while len(samples) < batch_size:
-            for bin_idx, num in enumerate(choose):
-                _, _, mem = self.memory[bin_idx]
-                if len(mem) == 0: continue
-                to_pick = min(num, batch_size - len(samples))
-                if to_pick == 0: break
-                sampled[bin_idx] += to_pick
-                picks = np.random.choice(len(mem), size=to_pick, replace=True)
-                samples.extend([mem[p] for p in picks])
-        for i, (s, im) in enumerate(zip(sampled, inmem)):
-            log_entries['bin' + str(i) + '_sampled'] = s
-            log_entries['bin' + str(i) + '_total'] = im
-        return samples
+    def sample(self, batch_size):
+        return random.sample(self.memory, batch_size)
 
     ### This allows one to call len() on a ReplayMemory object. E.g. len(replay_memory)
     def __len__(self):
-        length = sum([len(mem) for pos, cap, mem in self.memory])
-        return length
+        return len(self.memory)
 
 ##########################################################
 ### DQN
@@ -333,7 +285,7 @@ class DQN(nn.Module):
     ### automatically when forward() is called.
     def __init__(self, h, w, num_actions):
         super(DQN, self).__init__()
-        in_channels = 4 # Framestacking of grayscale frames
+        in_channels = 3 # Single RGB frame
         self.trunk = nn.Sequential(
             nn.Conv2d(in_channels, 32, kernel_size=8, stride=4),
             nn.Dropout2d(p=0.2),
@@ -428,7 +380,7 @@ def testMakeBatch():
     # Test mask
     test_replay_memory = ReplayMemory(batch_size)
     for i in range(batch_size):
-        state = torch.randn(1, 3, 80, 80)
+        state = torch.randn(1, 3, 80, 80, device=DEVICE)
         new_state = None
         if i % 2 == 0:
             new_state = torch.randn(1, 3, 80, 80, device=DEVICE)
@@ -510,7 +462,7 @@ def testPredictQValues():
     num_actions = 7
     net = DQN(screen_height, screen_width, num_actions).to(DEVICE)
     states_batch = torch.randn(batch_size, 3, 80, 80, device=DEVICE)
-    actions_batch = torch.randint(0, 7, (128, 1), device=DEVICE)
+    actions_batch = torch.randint(0, 7, (128, 1), device=DEVICE).long()
     state_action_values = doPredictQValues(net, states_batch, actions_batch)
     assert(type(state_action_values) == torch.Tensor and state_action_values.size() == (128, 1)), "Return value not correct shape."
     print("doPredictQValues test passed.")
@@ -626,16 +578,16 @@ def select_action(state, policy_net, num_actions, epsilon, steps_done = 0, boots
     for i, q in enumerate(qs):
         log_entries['q_value' + str(i)] = q
     if torch.rand(size=(1,)).item() < epsilon:
-        # Sample a random action uniformly.
-        action = (torch.randint(0, 2, size=(1,)) * 2 + 1)[:,None].long()
+        # Sample a random action between move right and jump right.
+        action = (torch.randint(0, 2, size=(1,)) * 3 + 1)[:,None].long()
         #action = torch.randint(0, num_actions, size=(1,))[:,None].long()
         log_entries['choice'] = 'random'
     else:
-        #action = torch.argmax(q_vals, dim=1)[:,None].long()
-        one = q_vals[0,1].item()
-        three = q_vals[0,3].item()
-        if one > three: action = torch.tensor([[1]], device=DEVICE).long()
-        else: action = torch.tensor([[3]], device=DEVICE).long()
+        action = torch.argmax(q_vals, dim=1)[:,None].long()
+        # one = q_vals[0,1].item()
+        # three = q_vals[0,3].item()
+        # if one > three: action = torch.tensor([[1]], device=DEVICE).long()
+        # else: action = torch.tensor([[3]], device=DEVICE).long()
         log_entries['choice'] = 'policy'
     log_entries['action'] = action.item()
     return action, new_epsilon
@@ -650,9 +602,9 @@ def select_action(state, policy_net, num_actions, epsilon, steps_done = 0, boots
 ### - next_states_batch: a tensor containing screens. 
 ### - rewards_batch: a tensor of shape batch_size x 1 containing reward values.
 ### - non_final_mask: a tensor of bytes of length batch_size containing a 0 if the state is terminal or 1 otherwise
-def doMakeBatch(replay_memory, batch_size, log_entries={}):
+def doMakeBatch(replay_memory, batch_size):
     assert batch_size > 0
-    samples = replay_memory.sample(batch_size, log_entries)
+    samples = replay_memory.sample(batch_size)
     first = samples[0]
     states_batch = torch.empty((batch_size, *first.state.shape[1:]), device=DEVICE)
     actions_batch = torch.empty((batch_size, 1), device=DEVICE).long()
@@ -717,8 +669,7 @@ def doComputeExpectedQValues(next_state_values, rewards_batch, gamma):
 ### Output:
 ### - A tensor scalar value
 def doComputeLoss(state_action_values, expected_state_action_values):
-    loss = F.smooth_l1_loss(state_action_values, expected_state_action_values,
-                            reduction='elementwise_mean')
+    loss = F.smooth_l1_loss(state_action_values, expected_state_action_values)
     return loss
 
 ### Run backpropagation. Make sure gradients are clipped between -1 and +1.
@@ -729,8 +680,10 @@ def doComputeLoss(state_action_values, expected_state_action_values):
 def doBackprop(loss, parameters):
     loss.backward()
     # Do gradient clipping based on the global norm.
-    torch.nn.utils.clip_grad_norm_(parameters, 0.1)
-
+    #torch.nn.utils.clip_grad_norm_(parameters, 0.1)
+    # Do gradient clipping.
+    for parameter in parameters:
+        parameter.grad.clamp_(-1, 1)
 
 #########################################################
 ### OPTIMIZE
@@ -751,7 +704,7 @@ def optimize_model(policy_net, target_net, replay_memory, optimizer, batch_size,
     ###         a. Create a tensor of shape [BATCH_SIZE, color(3), height, width] holding states
     ###         b. Create a tensor of shape [BATCH_SIZE, 1] holding actions
     ###         c. Create a tensor of shape [BATCH_SIZE, 1] holding rewards
-    states_batch, actions_batch, next_states_batch, rewards_batch, non_final_mask = doMakeBatch(replay_memory, batch_size, log_entries)
+    states_batch, actions_batch, next_states_batch, rewards_batch, non_final_mask = doMakeBatch(replay_memory, batch_size)
 
     ### Step 4: Get the action values predicted.
     ###         a. Call policy_net(state_batch) to get a tensor of shape [BATCH_SIZE, NUM_ACTIONS] containing Q-values
@@ -905,9 +858,6 @@ def train(num_episodes = NUM_EPISODES, load_filename = None, save_filename = Non
 
                 # If we are past bootstrapping we should perform one step of the optimization
                 log_entries['loss'] = np.nan
-                for i in range(3):
-                    log_entries['bin' + str(i) + '_sampled'] = np.nan
-                    log_entries['bin' + str(i) + '_total'] = np.nan
                 if steps_done > bootstrap_threshold:
                     optimize_model(policy_net, target_net if target_update > 0 else policy_net, replay_memory, optimizer, batch_size, gamma, writer, log_entries, steps_done)
                 logger.log(log_entries)
@@ -925,9 +875,9 @@ def train(num_episodes = NUM_EPISODES, load_filename = None, save_filename = Non
                 writer.add_scalar('train/duration', episode_steps, steps_done)
                 writer.add_scalar('train/max_reward', max_reward, steps_done)
 
-        # Should we update the target network?
-        if target_update > 0 and i_episode % target_update == 0:
-            target_net.load_state_dict(policy_net.state_dict())
+            # Should we update the target network?
+            if target_update > 0 and i_episode % target_update == 0:
+                target_net.load_state_dict(policy_net.state_dict())
                 
         # Should we evaluate?
         if steps_done > bootstrap_threshold and i_episode > 0 and i_episode % eval_interval == 0:
@@ -938,7 +888,7 @@ def train(num_episodes = NUM_EPISODES, load_filename = None, save_filename = Non
             # Evaluate 10 times
             for _ in range(EVAL_COUNT):
                 # Call the evaluation function
-                test_duration, test_max_reward = evaluate(policy_net, eval_epsilon, env)
+                test_duration, test_max_reward = evaluate(eval_net, eval_epsilon, env)
                 status, score = episode_status(test_duration, test_max_reward)
                 test_duration = score # Set test_duration to score to factor in death-penalty
                 test_average_duration = test_average_duration + test_duration
